@@ -2,6 +2,7 @@ import numpy as np
 from network import MLP
 from operations import mse_loss
 from tensor import Tensor
+from optimizers import Adam
 
 # Create synthetic data - let's do a simple binary classification problem
 def generate_data(n_samples=1000):
@@ -25,7 +26,10 @@ def generate_data(n_samples=1000):
     y = np.hstack([np.zeros(n_samples//2), np.ones(n_samples//2)])
     return X, y
 
-def train_epoch(model : MLP, X : np.ndarray, y : np.ndarray, learning_rate=1e-6):
+def train_epoch(model: MLP, X: np.ndarray, y: np.ndarray, optimizer):
+    # Zero gradients at start of each batch
+    optimizer.zero_grad()
+    
     # Forward pass
     output = model(Tensor(X, requires_grad=False))
     
@@ -36,12 +40,8 @@ def train_epoch(model : MLP, X : np.ndarray, y : np.ndarray, learning_rate=1e-6)
     # Backward pass
     loss.backward()
     
-    # Update weights
-    for param in model.parameters():
-        if param.grad is not None:
-            grad_data = np.array(param.grad.data) if isinstance(param.grad.data, memoryview) else param.grad.data
-            param.data -= learning_rate * grad_data
-            param.grad = None
+    # Use optimizer instead of manual update
+    optimizer.step()
             
     return loss.data
 
@@ -57,11 +57,12 @@ X_test, y_test = generate_data(200)
 
 # Create model
 model = MLP(in_features=2, hidden_features=[64, 32], out_features=1)
+optimizer = Adam(model.parameters(), lr=0.01)
 
 # Training loop
-n_epochs = 10000
+n_epochs = 1000
 for epoch in range(n_epochs):
-    loss = train_epoch(model, X_train, y_train, learning_rate=0.01)
+    loss = train_epoch(model, X_train, y_train, optimizer)
     
     if epoch % 10 == 0:
         train_acc = evaluate(model, X_train, y_train)
