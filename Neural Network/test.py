@@ -2,7 +2,79 @@ import numpy as np
 from network import MLP
 from operations import mse_loss
 from tensor import Tensor
-from optimizers import Adam
+from optimizers import SOAP
+
+##############################
+## HELPER CLASSES & FUNCTIONS
+##############################
+
+class TensorElement:
+    """Adapter for a single scalar element in a Tensor so that updating it updates the parent Tensor."""
+    def __init__(self, parent, i, j):
+        self.parent = parent
+        self.i = i
+        self.j = j
+
+    @property
+    def data(self):
+        return self.parent.data[self.i, self.j]
+
+    @data.setter
+    def data(self, value):
+        self.parent.data[self.i, self.j] = value
+
+    @property
+    def grad(self):
+        if self.parent.grad is None:
+            return None
+        return self.parent.grad[self.i, self.j]
+
+    @grad.setter
+    def grad(self, value):
+        if self.parent.grad is None:
+            self.parent.grad = np.zeros_like(self.parent.data)
+        self.parent.grad[self.i, self.j] = value
+
+def get_linear_weights(module):
+    """Recursively collects weight Tensors from modules that have a 'weight' attribute."""
+    weights = []
+    if hasattr(module, 'weight'):
+        weights.append(module.weight)
+    if hasattr(module, '_modules'):
+        for m in module._modules.values():
+            weights.extend(get_linear_weights(m))
+    return weights
+
+def tensor_to_matrix(tensor):
+    """Converts a Tensor representing a matrix into a 2D list of TensorElement adapters."""
+    m, n = tensor.data.shape
+    matrix = []
+    for i in range(m):
+        row = []
+        for j in range(n):
+            row.append(TensorElement(tensor, i, j))
+        matrix.append(row)
+    return matrix
+
+def zero_model_grad(module):
+    """Zeros gradients for parameters of the module recursively."""
+    for param in getattr(module, '_parameters', {}).values():
+        if param is not None:
+            param.grad = None
+    for sub in getattr(module, '_modules', {}).values():
+        zero_model_grad(sub)
+
+def update_biases(module, lr):
+    """Updates biases using a simple SGD step if they exist."""
+    if hasattr(module, 'bias') and module.bias.grad is not None:
+        module.bias.data -= lr * module.bias.grad
+    if hasattr(module, '_modules'):
+        for m in module._modules.values():
+            update_biases(m, lr)
+
+##############################
+## End of helper classes
+##############################
 
 # Create synthetic data - let's do a simple binary classification problem
 def generate_data(n_samples=1000):
@@ -26,9 +98,9 @@ def generate_data(n_samples=1000):
     y = np.hstack([np.zeros(n_samples//2), np.ones(n_samples//2)])
     return X, y
 
-def train_epoch(model: MLP, X: np.ndarray, y: np.ndarray, optimizer):
-    # Zero gradients at start of each batch
-    optimizer.zero_grad()
+def train_epoch(model: MLP, X: np.ndarray, y: np.ndarray, lr=0.01):
+    # Zero gradients for all parameters in the model
+    zero_model_grad(model)
     
     # Forward pass
     output = model(Tensor(X, requires_grad=False))
@@ -40,8 +112,13 @@ def train_epoch(model: MLP, X: np.ndarray, y: np.ndarray, optimizer):
     # Backward pass
     loss.backward()
     
-    # Use optimizer instead of manual update
-    optimizer.step()
+    # Update biases using SGD (if any); SOAP handles weight matrices already.
+    update_biases(model, lr)
+    
+    # Update each weight matrix via its SOAP optimizer
+    for soap_optimizer in soap_optimizers:
+        soap_optimizer.step()
+        soap_optimizer.zero_grad()
             
     return loss.data
 
@@ -57,12 +134,18 @@ X_test, y_test = generate_data(200)
 
 # Create model
 model = MLP(in_features=2, hidden_features=[64, 32], out_features=1)
-optimizer = Adam(model.parameters(), lr=0.01)
+# Extract the literal weight matrices from Linear layers in the model
+linear_weights = get_linear_weights(model)
+# Create a list of SOAP optimizers for each weight matrix (converted via tensor_to_matrix)
+soap_optimizers = []
+for weight in linear_weights:
+    matrix = tensor_to_matrix(weight)
+    soap_optimizers.append(SOAP(matrix, lr=0.01))
 
 # Training loop
 n_epochs = 1000
 for epoch in range(n_epochs):
-    loss = train_epoch(model, X_train, y_train, optimizer)
+    loss = train_epoch(model, X_train, y_train, lr=0.01)
     
     if epoch % 10 == 0:
         train_acc = evaluate(model, X_train, y_train)
