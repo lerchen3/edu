@@ -98,29 +98,32 @@ def generate_data(n_samples=1000):
     y = np.hstack([np.zeros(n_samples//2), np.ones(n_samples//2)])
     return X, y
 
-def train_epoch(model: MLP, X: np.ndarray, y: np.ndarray, lr=0.01):
-    # Zero gradients for all parameters in the model
-    zero_model_grad(model)
-    
-    # Forward pass
-    output = model(Tensor(X, requires_grad=False))
-    
-    # Compute loss (MSE)
-    target = Tensor(y.reshape(1, -1), requires_grad=False)
-    loss = mse_loss(output, target)
-    
-    # Backward pass
-    loss.backward()
-    
-    # Update biases using SGD (if any); SOAP handles weight matrices already.
-    update_biases(model, lr)
-    
-    # Update each weight matrix via its SOAP optimizer
-    for soap_optimizer in soap_optimizers:
-        soap_optimizer.step()
-        soap_optimizer.zero_grad()
-            
-    return loss.data
+def train_epoch(model: MLP, X: np.ndarray, y: np.ndarray, lr=0.01, batch_size=32):
+    num_samples = X.shape[1]  # X is shaped (features, n_samples)
+    indices = np.arange(num_samples)
+    np.random.shuffle(indices)
+    epoch_loss = 0.0
+    num_batches = 0
+    for i in range(0, num_samples, batch_size):
+        batch_idx = indices[i:i+batch_size]
+        X_batch = X[:, batch_idx]   # mini-batch data
+        y_batch = y[batch_idx]
+        # Zero gradients for the mini-batch
+        zero_model_grad(model)
+        # Forward pass using mini-batch
+        output = model(Tensor(X_batch, requires_grad=False))
+        target = Tensor(y_batch.reshape(1, -1), requires_grad=False)
+        loss = mse_loss(output, target)
+        # Backward pass on mini-batch loss
+        loss.backward()
+        # Update biases using SGD; SOAP optimizers update weight matrices
+        update_biases(model, lr)
+        for soap_optimizer in soap_optimizers:
+            soap_optimizer.step()
+            soap_optimizer.zero_grad()
+        epoch_loss += loss.data
+        num_batches += 1
+    return epoch_loss / num_batches
 
 def evaluate(model, X, y):
     output = model(Tensor(X)).data
@@ -145,7 +148,7 @@ for weight in linear_weights:
 # Training loop
 n_epochs = 1000
 for epoch in range(n_epochs):
-    loss = train_epoch(model, X_train, y_train, lr=0.01)
+    loss = train_epoch(model, X_train, y_train, lr=0.01, batch_size=32)
     
     if epoch % 10 == 0:
         train_acc = evaluate(model, X_train, y_train)
