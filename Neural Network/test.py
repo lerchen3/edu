@@ -1,8 +1,11 @@
 import numpy as np
-from network import MLP
-from operations import mse_loss
+from network import MLP, low_rank_MLP, MixtureOfExperts
+from operations import mse_loss, cross_entropy, softmax, relu
 from tensor import Tensor
 from optimizers import SOAP
+import matplotlib
+matplotlib.use('Agg')
+from layers import Sequential, ReLU
 
 ##############################
 ## HELPER CLASSES & FUNCTIONS
@@ -76,107 +79,72 @@ def update_biases(module, lr):
 ## End of helper classes
 ##############################
 
-# Create synthetic data - let's do a simple binary classification problem
-def generate_data(n_samples=1000):
-    # Generate two circular clusters
-    np.random.seed(42)
-    
-    # First cluster
-    r1 = np.random.normal(0, 1, n_samples//2)
-    theta1 = np.random.uniform(0, 2*np.pi, n_samples//2)
-    x1 = r1 * np.cos(theta1)
-    y1 = r1 * np.sin(theta1)
-    
-    # Second cluster
-    r2 = np.random.normal(3, 1, n_samples//2)
-    theta2 = np.random.uniform(0, 2*np.pi, n_samples//2)
-    x2 = r2 * np.cos(theta2)
-    y2 = r2 * np.sin(theta2)
-    
-    # Combine data
-    X = np.vstack([np.column_stack([x1, y1]), np.column_stack([x2, y2])]).T
-    y = np.hstack([np.zeros(n_samples//2), np.ones(n_samples//2)])
-    return X, y
+"""
+Create MNIST dataset and Mixture-of-Experts training using sklearn to avoid TensorFlow dependency
+"""
+from sklearn.datasets import fetch_openml
+# Download MNIST from openml (70000 samples)
+mnist = fetch_openml('mnist_784', version=1, as_frame=False)
+X = mnist.data.astype(np.float32)
+y = mnist.target.astype(int)
+# Normalize and split
+X = X / 255.0
+# First 60k for training, last 10k for test
+x_train = X[:60000].T
+y_train = y[:60000]
+x_test  = X[60000:].T
+y_test  = y[60000:]
+# One-hot encode labels
+num_classes = 10
+y_train_oh = np.eye(num_classes)[y_train].T
+y_test_oh  = np.eye(num_classes)[y_test].T
 
-def train_epoch(model: MLP, X: np.ndarray, y: np.ndarray, lr=0.01, batch_size=32):
-    num_samples = X.shape[1]  # X is shaped (features, n_samples)
-    indices = np.arange(num_samples)
-    np.random.shuffle(indices)
-    epoch_loss = 0.0
-    num_batches = 0
-    for i in range(0, num_samples, batch_size):
-        batch_idx = indices[i:i+batch_size]
-        X_batch = X[:, batch_idx]   # mini-batch data
-        y_batch = y[batch_idx]
-        # Zero gradients for the mini-batch
-        zero_model_grad(model)
-        # Forward pass using mini-batch
-        output = model(Tensor(X_batch, requires_grad=False))
-        target = Tensor(y_batch.reshape(1, -1), requires_grad=False)
-        loss = mse_loss(output, target)
-        # Backward pass on mini-batch loss
-        loss.backward()
-        # Update biases using SGD; SOAP optimizers update weight matrices
-        update_biases(model, lr)
-        for soap_optimizer in soap_optimizers:
-            soap_optimizer.step()
-            soap_optimizer.zero_grad()
-        epoch_loss += loss.data
-        num_batches += 1
-    return epoch_loss / num_batches
+# Experiment settings
+n_epochs = 8
+batch_size = 128
+lr = 0.01
 
-def evaluate(model, X, y):
-    output = model(Tensor(X)).data
-    predictions = (output > 0.5).astype(float)
-    accuracy = np.mean(predictions == y)
-    return accuracy
+def run_experiment(model, name):
+    print(f"\n=== {name} ===")
+    soap_opts = [SOAP(tensor_to_matrix(w), lr=lr) for w in get_linear_weights(model)]
+    for epoch in range(1, n_epochs+1):
+        perm = np.random.permutation(x_train.shape[1])
+        epoch_loss = 0.0
+        for i in range(0, perm.size, batch_size):
+            idx = perm[i:i+batch_size]
+            Xb = x_train[:, idx]
+            Yb = y_train_oh[:, idx]
+            zero_model_grad(model)
+            logits = model(Tensor(Xb, requires_grad=False))
+            probs = softmax(logits)
+            loss = cross_entropy(probs, Tensor(Yb, requires_grad=False))
+            loss.backward()
+            update_biases(model, lr)
+            for opt in soap_opts:
+                opt.step()
+                opt.zero_grad()
+            epoch_loss += loss.data
+        epoch_loss /= (perm.size / batch_size)
+        logits_test = model(Tensor(x_test, requires_grad=False))
+        preds_test = np.argmax(softmax(logits_test).data, axis=0)
+        acc = np.mean(preds_test == y_test)
+        print(f"Epoch {epoch}/{n_epochs} — Loss: {epoch_loss:.4f}, Test Acc: {acc:.4f}")
 
-# Generate data
-X_train, y_train = generate_data(1000)
-X_test, y_test = generate_data(200)
+# Vanilla MLP
+mlp = MLP(in_features=784, hidden_features=[8, 10], out_features=num_classes)
+run_experiment(mlp, "MLP")
 
-# Create model
-model = MLP(in_features=2, hidden_features=[64, 32], out_features=1)
-# Extract the literal weight matrices from Linear layers in the model
-linear_weights = get_linear_weights(model)
-# Create a list of SOAP optimizers for each weight matrix (converted via tensor_to_matrix)
-soap_optimizers = []
-for weight in linear_weights:
-    matrix = tensor_to_matrix(weight)
-    soap_optimizers.append(SOAP(matrix, lr=0.01))
+# LoRA (r=1)
+lora = low_rank_MLP(in_features=784, hidden_features=[8, 10], out_features=num_classes, num_in_sum=10, lora_r=1)
+run_experiment(lora, "LoRA")
 
-# Training loop
-n_epochs = 1000
-for epoch in range(n_epochs):
-    loss = train_epoch(model, X_train, y_train, lr=0.01, batch_size=32)
-    
-    if epoch % 10 == 0:
-        train_acc = evaluate(model, X_train, y_train)
-        test_acc = evaluate(model, X_test, y_test)
-        print(f"Epoch {epoch:3d} | Loss: {loss:.4f} | Train Acc: {train_acc:.4f} | Test Acc: {test_acc:.4f}")
+# Two-layer MoE
+moe_seq = Sequential(
+    MixtureOfExperts(input_dim=784, output_dim=8, num_specialized=8, num_shared=2, k=2, gamma=0.1),
+    ReLU(),
+    MixtureOfExperts(input_dim=8, output_dim=10, num_specialized=8, num_shared=2, k=2, gamma=0.1),
+    ReLU(),
+    MixtureOfExperts(input_dim=10, output_dim=num_classes, num_specialized=8, num_shared=2, k=2, gamma=0.1),
+)
+run_experiment(moe_seq, "TwoLayerMoE")
 
-# Final evaluation
-train_acc = evaluate(model, X_train, y_train)
-test_acc = evaluate(model, X_test, y_test)
-print("\nFinal Results:")
-print(f"Train Accuracy: {train_acc:.4f}")
-print(f"Test Accuracy: {test_acc:.4f}")
-
-# Optional: Visualize the decision boundary
-import matplotlib.pyplot as plt
-
-def plot_decision_boundary(X, y, model):
-    x_min, x_max = X[0].min() - 1, X[0].max() + 1
-    y_min, y_max = X[1].min() - 1, X[1].max() + 1
-    xx, yy = np.meshgrid(np.arange(x_min, x_max, 0.1),
-                        np.arange(y_min, y_max, 0.1))
-    
-    Z = model(Tensor(np.c_[xx.ravel(), yy.ravel()].T)).data
-    Z = Z.reshape(xx.shape)
-    
-    plt.contourf(xx, yy, Z, alpha=0.4)
-    plt.scatter(X[0], X[1], c=y, alpha=0.8)
-    plt.title("Decision Boundary")
-    plt.show()
-
-plot_decision_boundary(X_train, y_train, model)

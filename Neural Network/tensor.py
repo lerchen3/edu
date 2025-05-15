@@ -34,6 +34,17 @@ class Tensor:
             
             # Pass gradients to input tensors
             for input_tensor, grad in zip(self.prev_tensors, input_grads):
-                if input_tensor.requires_grad:
+                if isinstance(input_tensor, Tensor) and grad is not None and input_tensor.requires_grad:
                     input_tensor.backward(grad)
     
+    def __add__(self, other):
+        if not isinstance(other, Tensor):
+            return NotImplemented
+        from operations import elementwise_add
+        return elementwise_add(self, other)
+
+    def __radd__(self, other):
+        if not isinstance(other, Tensor):
+            return NotImplemented
+        from operations import elementwise_add
+        return elementwise_add(other, self)

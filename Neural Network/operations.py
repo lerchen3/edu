@@ -125,6 +125,127 @@ class MSELossFunction(Function):
         return (grad_pred * grad_output,  # grad wrt predictions 
                 None)  # grad wrt targets (not needed)
 
+class ElemAddFunction(Function):
+    @staticmethod
+    def forward(ctx, x, y):
+        ctx.save_for_backward(x, y)
+        return x.data + y.data
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # Gradient flows equally to both inputs
+        return grad_output, grad_output
+
+class ElemMulFunction(Function):
+    @staticmethod
+    def forward(ctx, x, y):
+        # Forward pass for elementwise multiplication
+        ctx.save_for_backward(x.data, y.data)
+        return x.data * y.data
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # Backward pass returns gradients for both inputs, handling broadcasting properly
+        x_data, y_data = ctx.saved_tensors
+        # gradient w.r.t. x: elementwise multiply by y_data
+        grad_x = grad_output * y_data
+        # gradient w.r.t. y: sum over feature dimension (axis 0) to collapse broadcast
+        grad_y = np.sum(grad_output * x_data, axis=0)
+        return grad_x, grad_y
+
+def elementwise_add(x: Tensor, y: Tensor) -> Tensor:
+    return ElemAddFunction.apply(x, y)
+
+def elementwise_mul(x: Tensor, y: Tensor) -> Tensor:
+    """Elementwise multiply two Tensors"""
+    return ElemMulFunction.apply(x, y)
+
+# Tensor indexing support
+class IndexFunction(Function):
+    @staticmethod
+    def forward(ctx, x, key):
+        ctx.save_for_backward(x.data.shape, key)
+        return x.data[key]
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        shape, key = ctx.saved_tensors
+        grad_x = np.zeros(shape)
+        grad_x[key] = grad_output
+        return grad_x, None
+
+def index(x: Tensor, key):
+    """Index into a Tensor with numpy-style slicing"""
+    return IndexFunction.apply(x, key)
+
+# Sigmoid activation function
+class SigmoidFunction(Function):
+    @staticmethod
+    def forward(ctx, x):
+        s = 1.0 / (1.0 + np.exp(-x.data))
+        ctx.save_for_backward(s)
+        return s
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        s, = ctx.saved_tensors
+        return grad_output * s * (1.0 - s)
+
+def sigmoid(x: Tensor) -> Tensor:
+    """Elementwise sigmoid activation"""
+    return SigmoidFunction.apply(x)
+
+# Softmax activation function
+class SoftmaxFunction(Function):
+    @staticmethod
+    def forward(ctx, x):
+        # x: shape (classes, batch_size)
+        # Subtract max for numerical stability
+        x_max = np.max(x.data, axis=0, keepdims=True)
+        e_x = np.exp(x.data - x_max)
+        s = e_x / np.sum(e_x, axis=0, keepdims=True)
+        ctx.save_for_backward(s)
+        return s
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        s, = ctx.saved_tensors
+        # grad_output: (classes, batch_size)
+        # Compute gradient: s * (grad_output - sum(grad_output * s)) per batch
+        dot = np.sum(grad_output * s, axis=0, keepdims=True)
+        grad = s * (grad_output - dot)
+        return grad
+
+def softmax(x: Tensor) -> Tensor:
+    """Softmax activation over classes"""
+    return SoftmaxFunction.apply(x)
+
+# Cross-entropy loss function for one-hot targets
+class CrossEntropyLossFunction(Function):
+    @staticmethod
+    def forward(ctx, pred, target):
+        """Compute average cross-entropy loss: pred are probabilities, target is one-hot"""
+        ctx.save_for_backward(pred.data, target.data)
+        # Numerical stability
+        eps = 1e-9
+        log_pred = np.log(pred.data + eps)
+        # Compute loss averaged over batch
+        loss = - np.sum(target.data * log_pred) / pred.data.shape[1]
+        return loss
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        pred_data, target_data = ctx.saved_tensors
+        batch_size = pred_data.shape[1]
+        eps = 1e-9
+        grad_pred = - (target_data / (pred_data + eps)) / batch_size
+        # grad_output is scalar w.r.t loss
+        return grad_pred * grad_output, None
+
+def cross_entropy(pred: Tensor, target: Tensor) -> Tensor:
+    """Cross-entropy loss for one-hot targets"""
+    return CrossEntropyLossFunction.apply(pred, target)
+
 # The actual operation functions that users call
 def matmul(w: Tensor, x: Tensor) -> Tensor:
     """Matrix multiplication of input tensor with weights.
